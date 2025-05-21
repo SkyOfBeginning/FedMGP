@@ -1,8 +1,11 @@
+import copy
+import time
 from copy import deepcopy
 import random
 
 import numpy as np
 import torch
+
 from timm.optim import create_optimizer
 from torch import nn
 from torch.autograd import Variable
@@ -25,7 +28,7 @@ class Client_DF(object):
         self.global_prompt = None
         self.local_prompt = None
         self.global_head= None
-        self.local_head = None
+        self.local_head = [None for i in range(args.task_num)]
 
         self.task_id = -1
         self.task_per_global_epoch = task_per_global_epoch
@@ -37,7 +40,7 @@ class Client_DF(object):
         self.lr = lr
         self.device=device
         self.method =method
-        if args.data_name == 'cifar100' or args.data_name=='5datasets':
+        if args.data_name == 'cifar100' or args.data_name=='5datasets' or args.data_name=='imagenetr':
             self.class_mask = class_mask
         else:
             self.class_mask = []
@@ -61,20 +64,32 @@ class Client_DF(object):
     def set_local_prompt(self,local_prompt):
         self.local_prompt = deepcopy(local_prompt)
 
+
     def set_global_prompt(self,global_prompt):
         self.global_prompt = deepcopy(global_prompt)
-        self.global_evaluate(task=self.task_id,test_global=True,nb_classes=self.nb_classes,topk=(1,self.topk))
+        self.global_evaluate(task=0,test_global=False,nb_classes=self.nb_classes,topk=(1,self.topk))
         self.global_evaluate(task=self.task_id,test_global=False,nb_classes=self.nb_classes,topk=(1,self.topk))
 
-    def get_head(self):
-        self.global_head,self.local_head = self.vit.get_head()
-        self.vit.init_head()
 
-    def set_global_head(self,global_head):
+
+    def set_global_prompt_no_test(self,global_prompt):
+        self.global_prompt = deepcopy(global_prompt)
+
+    def get_head(self):
+        self.global_head = self.vit.get_head()
+        # self.vit.init_head()
+
+    def set_global_head(self,global_head,local_prompt):
+        # self.local_prompt = deepcopy(local_prompt)
         self.global_head=deepcopy(global_head)
+        self.global_evaluate(task=self.task_id, test_global=False, nb_classes=self.nb_classes, topk=(1, self.topk))
+        self.global_evaluate(task=self.task_id, test_global=False, nb_classes=self.nb_classes, topk=(1, self.topk))
+
+    def set_global_head_no_test(self, global_head, local_prompt):
+        self.global_head = deepcopy(global_head)
 
     def set_vit_head(self):
-        self.vit.set_head(self.global_head,self.local_head)
+        self.vit.set_head(self.global_head)
 
     # def forward(self,x,task_id=-1, cls_features=None, train=False,train_global_prompt=False):
     #     res = self.vit( x, task_id, cls_features, train,train_global_prompt)
@@ -93,65 +108,82 @@ class Client_DF(object):
         trainset = self.train_dataset
         traindata, testdata = random_split(trainset,
                                            [int(len(trainset) * 0.7), len(trainset) - int(len(trainset) * 0.7)])
-        testdata = deepcopy(testdata)
+
         self.test_loader.append(testdata)
 
         self.traindata = traindata
 
     def get_data(self,task_id):
+        # print(task_id)
+        # print(self.class_mask)
         self.train_dataset = self.train_data[task_id]
         self.current_class = self.class_mask[task_id]
         print(f'{self.id} client，{task_id} task has {len(self.current_class)} classes:{self.current_class}')
         trainset = self.train_dataset
         traindata, testdata = random_split(trainset,
                                            [int(len(trainset) * 0.7), len(trainset) - int(len(trainset) * 0.7)])
-        testdata = deepcopy(testdata)
         self.test_loader.append(testdata)
 
         self.traindata = traindata
+
+
+
+
+    def update_data(self,round,args):
+        ###train###
+        # 判断是否要更新数据
+        task = round // self.task_per_global_epoch
+        if self.task_id != task:
+            if args.data_name == 'cifar100' or args.data_name == '5datasets' or args.data_name == 'imagenetr':
+                self.get_data(task)
+            self.task_id = task
 
 
     def train(self, round, args):
         self.topk = args.top_k
         self.nb_classes = args.nb_classes
         self.original_model.eval()
-        if self.global_prompt !=None:
-            self.set_vit_head()
-            self.set_vit_global_prompt()
-            self.set_vit_local_prompt()
-            print('已设置')
 
-        ###train###
-        # 判断是否要更新数据
-        task = round // self.task_per_global_epoch
-        if self.task_id != task:
-            if args.data_name == 'cifar100' or args.data_name=='5datasets':
-                self.get_data(task)
-            self.task_id = task
+        if self.global_prompt !=None:
+            self.set_vit_global_prompt()
+
+        if self.local_prompt !=None:
+            self.set_vit_local_prompt()
+
+        if self.global_head !=None:
+            self.set_vit_head()
+
+        if self.local_head[self.task_id] != None:
+            self.vit.set_local_head(self.local_head[self.task_id])
+
 
         self.vit.to(self.device)
-        train_loader = DataLoader(self.traindata, batch_size=self.batch_size, num_workers=args.num_workers,
-            pin_memory=args.pin_mem, shuffle=True)
+        train_loader = DataLoader(self.traindata, batch_size=self.batch_size, shuffle=True)
+
+        ########################################################################
+
         print(f'Client {self.id} on Task {self.task_id} is training global prompts')
+
         # 先训练global_prompt
         for n, p in self.vit.named_parameters():
             if n.startswith(tuple(['local_prompt', 'head_local'])):
                 p.requires_grad = False
             if n.startswith(tuple(['global_prompt', 'head.'])):
                 p.requires_grad = True
-
         # for n, p in self.vit.named_parameters():
         #     if p.requires_grad ==True:
         #         print(n)
+
         optimizer = torch.optim.Adam(self.vit.parameters(), lr=self.lr,weight_decay=1e-03)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
         for epoch in tqdm(range(self.local_epoch)):
             for iteration, (input,target) in enumerate(train_loader):
-                input, target = Variable(input, requires_grad=True).to(self.device, non_blocking=True), target.to(self.device,non_blocking=True)
+                input, target = Variable(input, requires_grad=True).to(self.device, non_blocking=True), target.long().to(self.device,non_blocking=True)
                 # input走一遍获得cls——token
                 with torch.no_grad():
                     if self.original_model is not None:
                         output = self.original_model(input)
+
                         cls_features = output['pre_logits']
                     else:
                         cls_features = None
@@ -189,11 +221,13 @@ class Client_DF(object):
         # for n, p in self.vit.named_parameters():
         #     if p.requires_grad == True:
         #         print(n)
-        optimizer = create_optimizer(args, self.vit)
+        train_loader = DataLoader(self.traindata, batch_size=self.batch_size, shuffle=True)
+        optimizer1 = torch.optim.Adam(self.vit.parameters(), lr=self.lr,weight_decay=1e-03)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
         for epoch in tqdm(range(self.local_epoch)):
-            for iteration, (input,target) in enumerate(train_loader):
-                input, target = Variable(input.float(), requires_grad=True).to(self.device, non_blocking=True), target.to(self.device,non_blocking=True)
+            for iteration, (input, target) in enumerate(train_loader):
+                input, target = Variable(input, requires_grad=True).to(self.device, non_blocking=True), target.long().to(self.device,non_blocking=True)
+
 
                 with torch.no_grad():
                     if self.original_model is not None:
@@ -202,32 +236,84 @@ class Client_DF(object):
                     else:
                         cls_features = None
                 if self.method == 'delay':
-                    output = self.vit(input, task_id=self.task_id,class_id = target, cls_features=cls_features, train=True,
-                                   train_global_prompt=False)
+                    output = self.vit(input, task_id=self.task_id, class_id=target, cls_features=cls_features,
+                                      train=True,
+                                      train_global_prompt=False)
                 else:
                     output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
                 logits = output['logits']
 
+                # print(logits.shape)
+
                 # 加了class_mask
                 mask = self.current_class
-                not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
+                not_mask = np.setdiff1d(np.arange(200), mask)
                 not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
                 logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
+
 
                 loss = criterion(logits, target)  # base criterion (CrossEntropyLoss)
                 if args.pull_constraint and 'reduce_sim' in output:
                     loss = loss - args.pull_constraint_coeff * output['reduce_sim']
-                optimizer.zero_grad()
+                optimizer1.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.vit.parameters(),args.clip_grad)
-                optimizer.step()
+                torch.nn.utils.clip_grad_norm_(self.vit.parameters(), args.clip_grad)
+                optimizer1.step()
 
         print('Local Prompt training completes!')
 
+        #################################################################################
+        # for n, p in self.vit.named_parameters():
+        #     if n.startswith(tuple(['local_prompt', 'head_local','global_prompt'])):
+        #         p.requires_grad = False
+        #     if n.startswith(tuple(['head.'])):
+        #         p.requires_grad = True
+        # # for n, p in self.vit.named_parameters():
+        # #     if p.requires_grad ==True:
+        # #         print(n)
+        #
+        # optimizer = torch.optim.Adam(self.vit.parameters(), lr=self.lr,weight_decay=1e-03)
+        # criterion = torch.nn.CrossEntropyLoss().to(self.device)
+        # for epoch in tqdm(range(self.local_epoch)):
+        #     for iteration, (input,target) in enumerate(train_loader):
+        #         input, target = Variable(input, requires_grad=True).to(self.device, non_blocking=True), target.long().to(self.device,non_blocking=True)
+        #         # input走一遍获得cls——token
+        #         with torch.no_grad():
+        #             if self.original_model is not None:
+        #                 output = self.original_model(input)
+        #
+        #                 cls_features = output['pre_logits']
+        #             else:
+        #                 cls_features = None
+        #         if self.method == 'delay':
+        #             output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True,
+        #                            train_global_prompt=True)
+        #         else:
+        #             output = self.vit.forward_only_head(cls_features)
+        #         logits = output['logits']
+        #
+        #         # 加了class_mask
+        #         mask = self.current_class
+        #         not_mask = np.setdiff1d(np.arange(args.nb_classes), mask)
+        #         not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
+        #         logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
+        #
+        #
+        #         loss = criterion(logits, target)  # base criterion (CrossEntropyLoss)
+        #         if args.pull_constraint and 'reduce_sim' in output:
+        #             loss = loss - args.pull_constraint_coeff * output['reduce_sim']
+        #         optimizer.zero_grad()
+        #         loss.backward()
+        #         torch.nn.utils.clip_grad_norm_(self.vit.parameters(), args.clip_grad)
+        #         optimizer.step()
+
+
         ###评估###
-        print('using global prompts...')
-        self.evaluate(True, 0,args.nb_classes,(1,args.top_k))
-        self.evaluate(True, self.task_id, args.nb_classes, (1, args.top_k))
+        # print('using global prompts...')
+        # self.evaluate(True, 0,args.nb_classes,(1,args.top_k))
+        # self.evaluate(True, self.task_id, args.nb_classes, (1, args.top_k))
+        self.local_head[self.task_id] = copy.deepcopy(self.vit.get_local_head())
+
         print('using local prompts...')
         self.evaluate(False, 0, args.nb_classes, (1, args.top_k))
         self.evaluate(False, self.task_id, args.nb_classes, (1, args.top_k))
@@ -243,11 +329,14 @@ class Client_DF(object):
         if self.global_prompt != None:
             self.set_vit_head()
             self.set_vit_global_prompt()
+        if self.local_prompt !=None:
             self.set_vit_local_prompt()
+        self.vit.set_local_head(self.local_head[task])
         test_data = self.test_loader[task]
-        test_loader = DataLoader(test_data, batch_size=8, shuffle=True, num_workers=4)
+        test_loader = DataLoader(test_data, batch_size=16, shuffle=True, num_workers=4)
         correct = 0
         total = 0
+        self.vit.to(self.device)
         for iteration, (input, target) in enumerate(test_loader):
             input = input.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
@@ -261,6 +350,8 @@ class Client_DF(object):
                 if self.method == 'delay':
                     output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=False,
                                       train_global_prompt=test_global)
+                elif self.method == 'head_only':
+                    output = self.vit.forward_only_head(cls_features, task_id=self.task_id, train=True)
                 else:
                     output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=False)
 
@@ -282,8 +373,10 @@ class Client_DF(object):
 
 
     def evaluate(self,test_global=True,task=0,nb_classes=None,topk=(1,5)):
+        self.vit.set_local_head(self.local_head[task])
+
         test_data = self.test_loader[task]
-        test_loader = DataLoader(test_data,batch_size=8,shuffle=True,num_workers=2)
+        test_loader = DataLoader(test_data,batch_size=16,shuffle=True)
         correct =0
         total = 0
         for iteration, (input, target) in enumerate(test_loader):
@@ -298,8 +391,11 @@ class Client_DF(object):
                     cls_features = None
 
                 if self.method == 'delay':
-                    output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=False,
+                    output = self.vit(input, task_id=task, cls_features=cls_features, train=False,
                                    train_global_prompt=test_global)
+
+                elif self.method == 'head_only':
+                    output = self.vit.forward_only_head(cls_features, task_id=self.task_id, train=True)
                 else:
                     output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=False)
 
@@ -318,9 +414,15 @@ class Client_DF(object):
             total += len(target)
 
         acc = 100 * correct / total
+
         if test_global:
             prompt = 'Global Prompt'
         else:
             prompt = 'Local Prompt'
-        print(f'Client {self.id} on Task {task} acc is {acc}, using')
+        print(f'{acc}')
+
+    def global_test(self,args):
+        self.global_prompt.to('cuda')
+        self.global_evaluate(task=0, test_global=False, nb_classes=self.nb_classes, topk=(1, self.topk))
+        self.global_evaluate(task=self.task_id, test_global=False, nb_classes=self.nb_classes, topk=(1, self.topk))
 
